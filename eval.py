@@ -170,10 +170,11 @@ def eval_coq_object(
     no_lines_before: bool,
     model: LLM,
     max_tokens: int,
-    temperature: float
+    temperature: float,
+    max_attempts: int = 5  # New parameter for refinement depth
 ) -> tuple[bool, str, str]:
     """
-    Calls the LLM, returns whether the proof passed without admits.
+    Iteratively calls the LLM and refines the proof based on Coq feedback.
     """
     if not coq_object.is_proof():
         raise ValueError(f'Not a proof: {coq_object.name}')
@@ -194,27 +195,56 @@ def eval_coq_object(
         llm_response = logfile_path.read_text().strip()
         return proof_passes(coq_object, llm_response, sertop_args, project_dir)
 
-    llm_response = call_llm(
-        coq_object.llm_prompt(no_dependencies=no_dependencies,
-                              no_lines_before=no_lines_before),
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        debug_info=f'{coq_object.in_relative_file}\n{coq_object.signature}'
-    )
-
-    log_llm_answer(
-        logs_dir=logs_dir,
+    # Initial prompt setup
+    initial_content = coq_object.llm_prompt(
         no_dependencies=no_dependencies,
-        no_lines_before=no_lines_before,
-        coq_object=coq_object,
-        llm_response=llm_response,
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature
+        no_lines_before=no_lines_before
     )
 
-    return proof_passes(coq_object, llm_response, sertop_args, project_dir)
+    # We maintain a history of the conversation for refinement
+    conversation_history = initial_content
+    last_error_info = ""
+
+    for attempt in range(max_attempts):
+        # On subsequent attempts, we guide the LLM to fix the error
+        current_prompt = conversation_history
+        if attempt > 0:
+            current_prompt += f"\n\n[PREVIOUS ATTEMPT]\n{llm_response}\n\n[SYSTEM FEEDBACK]\nThe above attempt failed with the following error:\n{last_error_info}\n\nPlease analyze the error and provide a corrected, complete proof."
+
+        llm_response = call_llm(
+            current_prompt,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            debug_info=f'{coq_object.name} - Attempt {attempt + 1}'
+        )
+
+        # Log each attempt (optional: you might want to version these logs)
+        log_llm_answer(
+            logs_dir=logs_dir,
+            no_dependencies=no_dependencies,
+            no_lines_before=no_lines_before,
+            coq_object=coq_object,
+            llm_response=llm_response,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature
+        )
+
+        # Validate the current response
+        success, err_type, err_msg = proof_passes(coq_object, llm_response, sertop_args, project_dir)
+
+        if success:
+            return success, err_type, err_msg
+
+        # If it failed, update the error info for the next loop iteration
+        last_error_info = f"Error Type: {err_type}\nMessage: {err_msg}"
+
+        # Optional: update history so the LLM sees what it tried before
+        #conversation_history += f"\n\n[PREVIOUS ATTEMPT]\n{llm_response}"
+
+    # If we exhaust attempts
+    return False, 'refinement_failed', f"Exhausted {max_attempts} attempts. Last error: {last_error_info}"
 
 
 def proof_passes(

@@ -1,6 +1,5 @@
 .env
-/logs-hs-to-coq
-/logs-verdi
+/logs-*/
 /hs-to-coq
 /verdi
 *-logs
@@ -15,3 +14,4 @@ __pycache__
 *.v
 *.vo
 *.glob
+*.lock

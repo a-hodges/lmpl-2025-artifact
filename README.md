@@ -148,3 +148,10 @@ This work was partially supported by the University of Toronto Department of Com
 # License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+```Bash
+opam switch coq-8.10.2
+eval $(opam env)
+python3 main.py hs-to-coq/base-thy --logs-dir logs-hs-to-coq --dry-run
+python3 main.py hs-to-coq/base-thy --logs-dir logs-hs-to-coq --models gpt-4o-mini
+```
