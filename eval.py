@@ -1,3 +1,4 @@
+import re
 from concurrent import futures
 import csv
 from pathlib import Path
@@ -206,13 +207,8 @@ def eval_coq_object(
     last_error_info = ""
 
     for attempt in range(max_attempts):
-        # On subsequent attempts, we guide the LLM to fix the error
-        current_prompt = conversation_history
-        if attempt > 0:
-            current_prompt += f"\n\n[PREVIOUS ATTEMPT]\n{llm_response}\n\n[SYSTEM FEEDBACK]\nThe above attempt failed with the following error:\n{last_error_info}\n\nPlease analyze the error and provide a corrected, complete proof."
-
         llm_response = call_llm(
-            current_prompt,
+            conversation_history,
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -231,19 +227,21 @@ def eval_coq_object(
             temperature=temperature
         )
 
-        # Validate the current response
-        success, err_type, err_msg = proof_passes(coq_object, llm_response, sertop_args, project_dir)
+        success, err_type, feedback = proof_passes(coq_object, llm_response, sertop_args, project_dir)
 
         if success:
-            return success, err_type, err_msg
+            return success, err_type, feedback
 
-        # If it failed, update the error info for the next loop iteration
-        last_error_info = f"Error Type: {err_type}\nMessage: {err_msg}"
+        # Update History based on the type of feedback
+        if err_type == 'search_results':
+            header = "[SYSTEM: SEARCH RESULTS]"
+        else:
+            header = f"[SYSTEM: ERROR - {err_type.upper()}]"
+            last_error_info = feedback
 
-        # Optional: update history so the LLM sees what it tried before
-        #conversation_history += f"\n\n[PREVIOUS ATTEMPT]\n{llm_response}"
+        conversation_history += f"\n\nYOUR ATTEMPT:\n{llm_response}\n\n{header}\n{feedback}\n"
+        conversation_history += "\nPlease adjust your proof accordingly."
 
-    # If we exhaust attempts
     return False, 'refinement_failed', f"Exhausted {max_attempts} attempts. Last error: {last_error_info}"
 
 
@@ -254,12 +252,10 @@ def proof_passes(
     project_dir: Path
 ) -> tuple[bool, str, str]:
     """
-    Whether the proof passes without any goals remaining, as well
-    as the type and error message if any, respectively.
+    Evaluates the proof tactic-by-tactic. 
+    Returns (Success, ErrorType, FeedbackMessage).
     """
-
     cmd = ['sertop', *sertop_args, '--implicit', '--omit_loc', '--print0']
-
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -276,38 +272,20 @@ def proof_passes(
         if proc.stdout is None or proc.stdin is None:
             raise RuntimeError('sertop produced no stdout or stdin')
 
+        # 1. Load context (Imports, Definitions, Lemma Signature)
         coq_code = coq_object.coqtop_input(
             with_answer=False
         )  # + coq_object.body
         # print()
         # print(coq_code)
         # print()
-
         add_cmd = sexpdata.dumps(['Add', [], coq_code])
-        # print()
-        # print(add_cmd)
-        # print()
-
         proc.stdin.write(add_cmd + '\n')
         proc.stdin.flush()
-
-        add_responses = parse_sertop_responses(proc)
-
-        last_sid = -1
-        # [Symbol('Answer'), 0, [Symbol('Added'), 34, '[LOC]', Symbol('NewTip')]]
-        for response in add_responses:
-            if isinstance(response, list) and len(response) > 2:
-                nested = response[2]
-                if isinstance(nested, list) and len(nested) > 1 and nested[0] == sexpdata.Symbol('Added'):
-                    sid = nested[1]
-                    if isinstance(sid, int) and sid > last_sid:
-                        last_sid = sid
-                if isinstance(nested, list) and len(nested) > 0 and nested[0] == sexpdata.Symbol('CoqExn'):
-                    # Then we couldn't add the original items? This is a fatal error.
-                    # (Never happened in our evaluations)
-                    print('Error: Couldn\'t add the original items:', nested)
-                    return False, '', ''
-
+        
+        # Initial Exec to set up the proof state
+        responses = parse_sertop_responses(proc)
+        last_sid = max([r[2][1] for r in responses if isinstance(r, list) and len(r) > 2 and r[2][0] == sexpdata.Symbol('Added')] + [-1])
         exec_cmd = sexpdata.dumps(['Exec', last_sid])
         # print()
         # print(exec_cmd)
@@ -320,87 +298,49 @@ def proof_passes(
         # You could probably bundle the original lines + llm response
         # into one Add command, but this is more useful for debugging
         # and returning error information, as well as using the timeout.
-        add_cmd = sexpdata.dumps(['Add', [], llm_response])
-        # print()
-        # print(add_cmd)
-        # print()
-        proc.stdin.write(add_cmd + '\n')
-        proc.stdin.flush()
 
-        add_responses = parse_sertop_responses(proc)
+        # 2. Iterate through tactics
+        tactics = split_tactics(llm_response)
+        for tactic in tactics:
+            # INTERCEPT: Search Integration
+            if tactic.strip().startswith("Search"):
+                query_cmd = sexpdata.dumps(['Query', [], [sexpdata.Symbol('Search'), [tactic]]])
+                proc.stdin.write(query_cmd + '\n')
+                proc.stdin.flush()
+                search_res = parse_sertop_responses(proc)
+                return False, 'search_results', f"Search Results for '{tactic}':\n{str(search_res)}"
 
-        last_sid = -1
-        # [Symbol('Answer'), 0, [Symbol('Added'), 34, '[LOC]', Symbol('NewTip')]]
-        for response in add_responses:
-            if isinstance(response, list) and len(response) > 2:
-                nested = response[2]
-                if isinstance(nested, list) and len(nested) > 1 and nested[0] == sexpdata.Symbol('Added'):
-                    sid = nested[1]
-                    if isinstance(sid, int) and sid > last_sid:
-                        last_sid = sid
-                if isinstance(nested, list) and len(nested) > 0 and nested[0] == sexpdata.Symbol('CoqExn'):
-                    # Then we couldn't add the LLM response in the first place (usually a syntax error).
-                    # print(nested)
-                    for item in nested[1]:
-                        if isinstance(item, list) and len(item) > 1 and item[0] == sexpdata.Symbol('str'):
-                            return False, 'add_err', item[1].replace('\n', ' ').strip()
-                    return False, 'unknown', 'unknown'
+            # Standard Tactic Execution
+            add_cmd = sexpdata.dumps(['Add', [], tactic])
+            proc.stdin.write(add_cmd + '\n')
+            proc.stdin.flush()
 
-        exec_cmd = sexpdata.dumps(['Exec', last_sid])
-        # print()
-        # print(exec_cmd)
-        # print()
+            add_responses = parse_sertop_responses(proc)
 
-        proc.stdin.write(exec_cmd + '\n')
-        proc.stdin.flush()
-        # exec_responses = parse_sertop_responses(proc)
-        with futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(parse_sertop_responses, proc)
-            try:
-                exec_responses = future.result(timeout=30)
-            except futures.TimeoutError:
-                # Sometimes the LLM generates proofs that causes Sertop to hang.
-                # In that case the proof is simply incorrect.
-                print("\nTimeout: sertop did not respond in 30 seconds.")
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=10)
-                except Exception:
-                    proc.kill()
-                return False, 'timeout', 'Proof timed out'
+            # Find New SID
+            current_sid = -1
+            for resp in add_responses:
+                if isinstance(resp, list) and len(resp) > 2 and resp[2][0] == sexpdata.Symbol('Added'):
+                    current_sid = resp[2][1]
+                if isinstance(resp, list) and len(resp) > 2 and resp[2][0] == sexpdata.Symbol('CoqExn'):
+                    return False, 'syntax_error', f"Syntax error in tactic: {tactic}"
 
-        # last_response = exec_responses[-1] if exec_responses else None
-        # Successful response: exec response: [Symbol('Feedback'), [[Symbol('doc_id'), 0], [Symbol('span_id'), 34], [Symbol('route'), 0], [Symbol('contents'), Symbol('Processed')]]]
-        # Failed response:
+            # Execute Tactic
+            proc.stdin.write(sexpdata.dumps(['Exec', current_sid]) + '\n')
+            proc.stdin.flush()
+            
+            exec_responses = parse_sertop_responses(proc)
+            for resp in exec_responses:
+                # Check for Feedback Errors (Tactic failures)
+                if isinstance(resp, list) and resp[0] == sexpdata.Symbol('Feedback'):
+                    if not feedback_is_ok(resp[1]):
+                        goal_state = get_current_goals(proc)
+                        msg = feedback_message(resp[1])
+                        return False, 'tactic_failure', f"Tactic '{tactic}' failed: {msg}\nProof State:\n{goal_state}"
 
-        # ALSO MODIFY HERE to implement refinement
-        for response in exec_responses:
-            if isinstance(response, list) and len(response) > 0:
-                answer_or_feedback = response[0]
-
-                if answer_or_feedback == sexpdata.Symbol('Feedback'):
-                    feedback = response[1]
-                    if not feedback_is_ok(feedback):
-                        error_message = feedback_message(feedback)
-                        # print('Feedback err:', error_message)
-                        # Get the erorr message via ^^^ to implement feedback
-                        return False, 'feedback', error_message
-                elif answer_or_feedback == sexpdata.Symbol('Answer'):
-                    answer = response
-                    if not answer_is_ok(answer):
-                        error_message = answer_message(answer)
-                        # print('Answer err:', error_message)
-                        # Get the erorr message via ^^^ to implement feedback
-                        return False, 'answer', error_message
-                else:
-                    # This never happened in our evaluations.
-                    print("Unknown response type:", answer_or_feedback)
-                    print("Do not trust this evaluation! Returning False.")
-                    return False, 'unknown_response_type', ''
-
-        result = not admitted(llm_response)
-        if not result:
-            return False, 'admitted', 'Proof admitted.'
+        # 3. Final Check: No goals remaining
+        if admitted(llm_response):
+            return False, 'admitted', 'Proof contains Admitted or Admit.'
         return True, '', ''
 
     finally:
@@ -408,6 +348,28 @@ def proof_passes(
             proc.stdin.close()
             proc.terminate()
             proc.wait(timeout=5)
+
+
+def split_tactics(llm_response: str) -> list[str]:
+    """Splits Coq code into individual tactics based on the period terminator."""
+    # Matches a dot followed by whitespace or end of string, avoiding dots in comments
+    # This is a heuristic; complex notations might require a more robust parser.
+    tactics = re.split(r'\.(?=\s|$)', llm_response)
+    return [t.strip() + "." for t in tactics if t.strip()]
+
+def get_current_goals(proc: subprocess.Popen) -> str:
+    """Queries sertop for the current proof state (hypotheses and goals)."""
+    try:
+        query_cmd = sexpdata.dumps(['Query', [], [sexpdata.Symbol('Goals'), []]])
+        proc.stdin.write(query_cmd + '\n')
+        proc.stdin.flush()
+        
+        responses = parse_sertop_responses(proc)
+        # Simplified extraction: in practice, you'd parse the S-exp for 'fg_goals'
+        # For this implementation, we'll return a string representation of the response
+        return str(responses).replace('\\n', '\n')
+    except Exception as e:
+        return f"Could not retrieve goals: {e}"
 
 
 def admitted(llm_response: str) -> bool:
