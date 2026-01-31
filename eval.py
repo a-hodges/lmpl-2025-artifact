@@ -16,34 +16,63 @@ from models import LLM
 from serapi import parse_sertop_responses
 
 
-def estimate_eval_input_tokens(coq_objects: list[CoqObject], no_dependencies: bool, no_lines_before: bool) -> int:
-    """Estimate the total input token cost for the experiment."""
-    return sum(
-        count_tokens(SYSTEM_PROMPT + "\n" + coq_object.llm_prompt(
+MAX_ATTEMPTS = 5
+
+
+def estimate_eval_input_tokens(
+    coq_objects: list[CoqObject], 
+    no_dependencies: bool, 
+    no_lines_before: bool,
+    max_tokens: int = 2048,
+    max_attempts: int = MAX_ATTEMPTS
+) -> int:
+    """
+    Estimate total input token cost, accounting for the growing context 
+    across multiple refinement attempts.
+    """
+    total_tokens = 0
+    # Heuristic for the size of a typical Coq error message + goal state
+    ESTIMATED_FEEDBACK_TOKENS = 350 
+    
+    for coq_object in coq_objects:
+        if not coq_object.is_proof():
+            continue
+            
+        # The base prompt used in Attempt 1
+        base_prompt = SYSTEM_PROMPT + "\n" + coq_object.llm_prompt(
             no_dependencies=no_dependencies, no_lines_before=no_lines_before
-            )
         )
-        for coq_object in coq_objects if coq_object.is_proof()
-    )
+        base_tokens = count_tokens(base_prompt)
+        
+        # Each new attempt 'i' includes all previous outputs and feedback.
+        # Total Input = Base + (Base + Out1 + Feed1) + (Base + Out1 + Feed1 + Out2 + Feed2) ...
+        # Simplified: Total = (max_attempts * base_tokens) + (sum of growing previous context)
+        # Using arithmetic progression: (N*(N-1)/2) * (avg_output_size + feedback_size)
+        growth_per_step = max_tokens + ESTIMATED_FEEDBACK_TOKENS
+        history_penalty = (max_attempts * (max_attempts - 1) // 2) * growth_per_step
+        
+        total_tokens += (max_attempts * base_tokens) + history_penalty
+        
+    return int(total_tokens)
 
 
-def estimate_eval_output_tokens(coq_objects: list[CoqObject], max_tokens: int, bound: Literal['upper', 'lower']) -> int:
+def estimate_eval_output_tokens(
+    coq_objects: list[CoqObject], 
+    max_tokens: int,
+    bound: Literal['upper', 'lower'],
+    max_attempts: int = MAX_ATTEMPTS
+) -> int:
     """
-    Estimate the total output token cost for the experiment based on the ORIGINAL ANSWERS.
-
-    Note that for reasoning models the estimation won't be as correct. This only estimates
-    the final output, and based on the asnwers.
+    Estimate total output token cost. Upper bound now scales with attempts.
     """
+    proof_objects = [obj for obj in coq_objects if obj.is_proof()]
+    
     if bound == 'lower':
-        return sum(
-            count_tokens(coq_object.body)
-            for coq_object in coq_objects if coq_object.is_proof()
-        )
+        # Assumes every proof passes on the very first attempt
+        return sum(count_tokens(obj.body) for obj in proof_objects)
     else:
-        return sum(
-            max_tokens
-            for coq_object in coq_objects if coq_object.is_proof()
-        )
+        # Assumes every proof exhausts the maximum attempts allowed
+        return len(proof_objects) * max_tokens * max_attempts
 
 
 def eval_coq_objects(
@@ -172,7 +201,7 @@ def eval_coq_object(
     model: LLM,
     max_tokens: int,
     temperature: float,
-    max_attempts: int = 5  # New parameter for refinement depth
+    max_attempts: int = MAX_ATTEMPTS  # New parameter for refinement depth
 ) -> tuple[bool, str, str]:
     """
     Iteratively calls the LLM and refines the proof based on Coq feedback.

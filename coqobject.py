@@ -110,7 +110,9 @@ The imports in the current file are provided below for context:
 {requires_only}
 </imports>
 
-Respond ONLY with the complete proof body, wrapped strictly between "Proof." and "Qed.", without repeating the signature.
+Respond ONLY with one of the following:
+- The complete proof body, wrapped strictly between "Proof." and "Qed.", without repeating the signature.
+- SEARCH(pattern) where pattern is a Coq expression you would like to search for in the codebase to help you construct the proof.
 """.strip()
             else:
                 return f"""
